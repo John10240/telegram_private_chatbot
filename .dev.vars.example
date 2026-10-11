@@ -1,0 +1,9 @@
+# Copy to .dev.vars for local Wrangler use. Never commit real secrets.
+BOT_TOKEN="replace-with-telegram-bot-token"
+SUPERGROUP_ID="-1001234567890"
+WEBHOOK_SECRET="replace-with-a-long-random-secret"
+PUBLIC_URL="https://your-worker.example.com"
+TURNSTILE_SITE_KEY="replace-with-site-key"
+TURNSTILE_SECRET_KEY="replace-with-secret-key"
+FILTER_KEYWORDS="广告,赌博,SCAM"
+# ADMIN_IDS="123456789"

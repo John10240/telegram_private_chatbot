@@ -1,6 +1,17 @@
-name = "telegram_private_chatbot"
+name = "telegram-private-chatbot"
 main = "worker.js"
 compatibility_date = "2024-11-30"
+# 手动使用 Wrangler 部署时，保留 Cloudflare 后台设置的普通变量。
+keep_vars = true
 
-# 注意：KV 命名空间 ID 每个用户都不一样，
-# 所以不能写死在这里。用户需要在 Cloudflare 后台手动绑定。
+# 当前采用 Cloudflare 编辑器手动发布 worker.js，TOPIC_MAP 在后台保持绑定。
+# 下方只保留示例，不公开实际 namespace ID。
+# 使用 Wrangler 真实部署前必须在 Git 忽略的本地配置中填入自己的 ID。
+# 独立测试必须使用专用 namespace，不能复用生产 KV。
+# [[kv_namespaces]]
+# binding = "TOPIC_MAP"
+# id = "YOUR_KV_NAMESPACE_ID"
+
+# 配置说明见 README.md；公开变量可在后台设置。
+# BOT_TOKEN、WEBHOOK_SECRET、TURNSTILE_SECRET_KEY 必须作为 secrets 设置。
+# PUBLIC_URL 必须为此 Worker 的 HTTPS 根地址，且 hostname 在 Turnstile 允许列表内。

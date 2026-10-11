@@ -1,155 +1,174 @@
-# 🛡️ TeleGuard (v4.0)
+# Telegram Private Chatbot: Turnstile moderation edition
 
-[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/jikssha/telegram_private_chatbot)
-![GitHub stars](https://img.shields.io/github/stars/jikssha/telegram_private_chatbot?style=social)
-![License](https://img.shields.io/badge/License-MIT-blue.svg)
-[![Telegram](https://img.shields.io/badge/Telegram-DM-blue?style=social&logo=telegram)](https://t.me/vaghr_wegram_bot)
+[简体中文](<README.md>) | [Upstream project](https://github.com/jikssha/telegram_private_chatbot)
 
-[🇺🇸 English](README_EN.md) | [🇨🇳 简体中文](README.md)
+Based on upstream v5.3. A single Cloudflare Worker handles Telegram private messages, forum topics and the Turnstile verification page. State remains in the `TOPIC_MAP` KV binding.
 
-**Telegram Private Chatbot** is a high-performance, two-way private messaging bot based on **Cloudflare Workers**. It is designed to solve the problem of spam harassment on Telegram, featuring a zero-latency local CAPTCHA verification system, a powerful set of administrator commands, and a seamless message forwarding experience.
+## Features
 
-Deploy a free, enterprise-grade customer service system utilizing Cloudflare's powerful edge computing network without purchasing any servers.
+- Rolling24-hour verification for non-trusted users; permanent trust bypasses verification and filtering.
+- Turnstile success automatically submits the webpage, followed by signed confirmation from the matching Telegram account.
+- First-message queuing, blacklist management, topic-user buttons and global keyword settings through Bot commands.
+- Administrator commands support `/command@your_bot` and ignore commands addressed to other bots.
+- Telegram command scopes can restrict management menus to administrators of one group.
+- Existing topic mappings, permanent trust and blocks remain compatible. Actual credentials, account identifiers and KV namespace IDs are excluded from the repository.
 
----
+## Policy
 
-## 📑 Table of Contents
+- **Blocked users** are silently ignored, including trusted users.
+- **Trusted users** bypass verification and keyword filtering, but remain subject to message rate limits and closed conversations.
+- **Other users** have text and media captions filtered before queuing/forwarding, even after successful verification. Matches are silently dropped, not automatically blocked.
+- Verification lasts **24 hours after success**, not until midnight. The first ordinary message after expiry requires verification again.
+- First messages wait for Turnstile success on the webpage, which automatically submits the token, then press the button in the bot's newest confirmation message. Its signed proof binds the challenge, account and expiry, avoiding a wait for the website's passed flag to propagate across KV regions. Only the matching Telegram account can confirm and forward queued messages.
 
-* [✨ Key Features](#-key-features)
-* [🛠️ Administrator Commands](#-administrator-commands)
-* [🚀 Deployment Tutorial](#-deployment-tutorial)
-    * [Method 1: One-Click Deploy via GitHub (Recommended)](#method-1-one-click-deploy-via-github-recommended-)
-    * [Method 2: Manual Deployment](#method-2-manual-deployment-simple--direct)
-    * [Final Step: Activate Webhook](#final-step-activate-webhook-crucial)
-* [❓ FAQ](#-faq)
-* [📈 Star History](#-star-history)
+Links expire after five minutes. The queue retains the first ten unique messages; overflow, expired queues and failed deliveries require resending. `/start` starts verification or asks the user to send a message; other private commands are ignored. Queued messages are checked again against current policy during replay.
 
----
+Manage the global list in the admin group with `/keywords`, `/setkeywords word1,word2`, or the keyword entry in `/menu`. Bot settings persist in KV as `settings:filter_keywords` and replace the dashboard `FILTER_KEYWORDS` default. `/clearkeywords` requires button confirmation, persists an empty override and disables filtering without restoring the dashboard default. Up to 100 words, 128 characters per word and 2048 characters total; values are normalized and deduplicated. Regional propagation may take about a minute; no redeploy is needed.
 
-## ✨ Key Features
+Use English/Chinese commas or newlines as separators. Matching is case-insensitive, normalizes compatibility/full-width characters and removes common zero-width characters. Images, audio and file contents are not inspected.
 
-Version 4.0 removes all unstable external API dependencies, focusing on **extreme speed** and **absolute stability**.
+Non-trusted text/captions are sent from checked snapshots, so editing the original while verification is pending cannot bypass filtering. Trusted users keep original-message forwarding. If filtering leaves only one member of an album, it is sent individually instead of as an invalid one-item media group.
 
-| Feature | Description |
-| :--- | :--- |
-| **⚡ Zero-Latency Verification** | Uses a **local curated trivia database**. Verifies instantly, completely eliminating network timeouts and API errors with a 100% success rate. |
-| **🛡️ Smart Anti-Spam** | **Short ID mechanism** fixes the Telegram button click failure bug. Provides a **30-day disturbance-free period** after verification, balancing security and user experience. |
-| **💬 Topic Group Management** | Utilizes **Telegram Forum Topics** to automatically create a separate topic for each private chat user, isolating messages for organized management. |
-| **👮 Invisible Command System** | Automatically **intercepts** commands starting with `/` sent by users to prevent harassment. Admin commands are only effective within the administrator group. |
-| **🔒 Permission Control** | Powerful command set: Supports **Ban (/ban)**, **Unban (/unban)**, **Close Ticket (/close)**, and **Trust (/trust)** operations. |
-| **☁️ Serverless** | Runs entirely on Cloudflare Workers. **Zero cost**, server-free, maintenance-free, and handles high concurrency. |
-| **📸 Multimedia Support** | Perfectly supports two-way forwarding of text, images, videos, files, and other message formats without losing any details. |
+## Admin commands
 
----
+Only administrators of the configured group, or users additionally authorized through `ADMIN_IDS`, can manage users and send replies. All actions must occur in that group.
 
-## 🛠️ Administrator Commands
+| Command | Effect |
+| --- | --- |
+| `/menu` | Open the group button menu: blacklist/keyword settings/UID help in General, with additional topic-user management in a user topic. State changes prompt for confirmation. |
+| `/keywords` | View the global list and setup instructions. |
+| `/setkeywords word1,word2` | Replace, normalize and deduplicate the global list. |
+| `/clearkeywords` | Clear the list and disable filtering after button confirmation. |
+| `/block [UID] [reason]` | Block the topic user, or a specified positive Telegram UID without needing a topic. |
+| `/unblock [UID]` | Remove the block. Prior trust/verification is not restored. |
+| `/ban`, `/unban` | Compatible aliases, also accept a UID. |
+| `/blocklist [cursor]` | Paginated blacklist, with the next-page command in the result. |
+| `/trust [UID]` | Permanently bypass verification and filtering; does not remove a block. |
+| `/untrust [UID]` | Revoke trust and verification. |
+| `/reset [UID]` | Clear trust, verification and pending challenge. |
+| `/close`, `/open` | Close or reopen the conversation in its user topic. |
+| `/info` | Show topic user information and moderation status. |
+| `/cleanup` | Remove deleted-topic mappings; keep permanent trust and blocks. |
 
-> **Note**: The following commands are only effective within **topics in the administrator group**. Commands sent by users in private chats will be silently intercepted and will not disturb administrators.
+Explicit-UID moderation commands also work in General. All administrator commands accept `/command@your_bot`, including UID/reason arguments. Addressed commands query Telegram `getMe` to validate the current bot's username. Other bots' commands and unknown slash commands are ignored, never forwarded as replies; bare commands remain valid.
 
-| Command | Action | Scenario |
-| :--- | :--- | :--- |
-| `/close` | **Force Close Chat**<br>The bot will notify the user that the chat has ended and reject new messages. | Ticket resolved; politely ending the consultation. |
-| `/open` | **Reopen Chat**<br>Resumes message forwarding for the user. | Accidental closure, or the user needs to contact again. |
-| `/ban` | **Ban User**<br>The bot will completely ignore all messages from this user (no notification). | Malicious spamming, ad bots. |
-| `/unban` | **Unban User**<br>Restores the user's normal communication permissions. | Giving a second chance. |
-| `/trust` | **Permanent Trust**<br>The user will be permanently exempt from CAPTCHA verification (never expires). | Acquaintances, VIP clients, long-term partners. |
-| `/reset` | **Reset Verification**<br>Forcibly clears the user's verification status; re-verification required next time. | Testing verification flow, or suspected account compromise. |
-| `/info` | **View Info**<br>Displays the current user's UID, Topic ID, and profile link. | Checking user details. |
+### Command menu scopes
 
----
+BotFather's ordinary `/setcommands` sets the default list. Restricting management commands to one group requires Telegram Bot API `setMyCommands` scopes. This is a one-time Telegram-side configuration, not automatically applied by the Worker; configure each new bot separately.
 
-## 🚀 Deployment Tutorial
+| Scope | Commands |
+| --- | --- |
+| `default` | Only `start`, as the fallback for private chats and other groups. |
+| `chat`, with the management group ID | Only `start` for ordinary members of that group. |
+| `chat_administrators`, with the same group ID | The full administrator list below. |
+| `chat_member`, with the same group and a user ID | Optional for non-admin members authorized through `ADMIN_IDS`; menu visibility does not grant permission. |
 
-### Prerequisites
-1.  **Telegram Bot**: Apply for a bot from [@BotFather](https://t.me/BotFather) and get the `Token`.
-    * *Important*: Turn off **Group Privacy** in BotFather (`/mybots` > Settings > Group Privacy > Turn off).
-2.  **Administrator Group**: Create a Telegram group and **enable Topics**.
-    * Add the bot to the group and set it as an **Administrator** (grant "Manage Topics" permission).
-    * Get the Group ID (usually starts with `-100`).
-    > **Tip for getting SUPERGROUP_ID**: In Telegram Desktop, right-click any message in the group and copy the message link. The link will contain a segment like `-100xxxxxxxxxx` or `xxxxxxxxxx`. If you only see numbers `xxxxxxxxxx`, add `-100` in front to get the full `SUPERGROUP_ID` (same applies to private channels/groups).
+Default `setMyCommands` request:
 
-### Method 1: One-Click Deploy via GitHub (Recommended ★)
+```json
+{
+  "scope": { "type": "default" },
+  "language_code": "",
+  "commands": [{ "command": "start", "description": "Start verification or send a message" }]
+}
+```
 
-This is the simplest automated deployment method. Cloudflare will automatically redeploy your Worker when you update your GitHub repository.
+For administrators, use the following scope and replace `commands` with command/description objects from this list. Replace the group placeholder locally. Never commit actual Tokens or request logs.
 
-1.  **Fork this repository** to your GitHub account.
-2.  Log in to the [Cloudflare Dashboard](https://dash.cloudflare.com/).
-3.  Navigate to **Workers & Pages** -> **Create Application**.
-4.  Click the **Connect to Git** tab.
-5.  Authorize Cloudflare to access your GitHub and select the `telegram_private_chatbot` repository you just forked.
-6.  **Configure Deployment**:
-    * Project Name: `telegram-private-chatbot` (or any name).
-    * Production Branch: Usually `main` or `master`.
-    * Keep others as default and click **Save and Deploy**.
-7.  **⚠️ Crucial Step: Bind Database & Variables**
-    * After deployment, go to the **Settings** -> **Variables** page of the Worker.
-    * **Bind KV Database** (Required):
-        * In the Cloudflare sidebar menu **KV**, create a new Namespace (e.g., named `TOPIC_MAP`).
-        * Go back to the Worker's Variables page, scroll down to **KV Namespace Bindings**.
-        * Click **Add binding**, set Variable name to `TOPIC_MAP` (must be uppercase), and select the Namespace you just created.
-    * **Add Environment Variables**:
-        * `BOT_TOKEN`: Your bot token.
-        * `SUPERGROUP_ID`: Your group ID (e.g., -100123...).
-8.  **Final Step**: After configuration, go to the **Deployments** tab at the top, find the latest deployment record, and click **Retry deployment** on the right to apply variables.
+```json
+{ "type": "chat_administrators", "chat_id": "<SUPERGROUP_ID>" }
+```
 
-### Method 2: Manual Deployment (Simple & Direct)
+Administrator command list (without `/`):
 
-If you don't want to link GitHub, you can copy the code directly.
+```text
+menu - Open the administrator button menu
+info - Show the topic user's information and status
+block - Block the topic user or a supplied UID with an optional reason
+unblock - Unblock the topic user or a supplied UID
+blocklist - Show the blacklist and next-page command
+trust - Permanently bypass verification and keyword filtering
+untrust - Revoke trust and require fresh verification
+reset - Reset verification and permanent trust
+close - Close the current user conversation
+open - Reopen the current user conversation
+cleanup - Remove stale topic mappings while keeping trust and blocks
+keywords - Show global keyword filter settings
+setkeywords - Replace the list using commas or newlines
+clearkeywords - Confirm clearing the list and disabling filtering
+ban - Compatible alias for block
+unban - Compatible alias for unblock
+```
 
-1.  Log in to [Cloudflare Dashboard](https://dash.cloudflare.com/).
-2.  Go to **Workers & Pages** -> **Create Application** -> **Create Worker**, start from `Hello World`.
-3.  Name your Worker and click **Deploy**.
-4.  Click **Edit code**, copy and paste all code from `worker.js` in this project, overwriting the original code.
-5.  Click **Deploy** in the top right corner.
-6.  **Configure KV & Variables**:
-    * Go to **Settings** -> **Variables**.
-    * Add KV Binding: Variable name `TOPIC_MAP`, bind to a KV database.
-    * Add Environment Variables: `BOT_TOKEN` and `SUPERGROUP_ID`.
-    * Click **Save and Deploy**.
+- Check the language-neutral list (`language_code: ""`) and previously configured language lists such as `zh` and `en`. Read back with `getMyCommands` using the same scope and language.
+- Old `all_private_chats`, `all_group_chats`, `all_chat_administrators` or member-specific lists can override defaults. Remove obsolete overrides with `deleteMyCommands` as appropriate.
+- Hidden commands are not authorization: users can still type them, but the Worker checks the configured group and administrator identity.
+- Clients may cache an old menu; leave and reopen the chat. Do not put the full management list back into BotFather's default list or it will appear globally again.
 
----
+## Deployment
 
-### Final Step: Activate Webhook (Crucial)
+1. Create a Telegram bot with [@BotFather](https://t.me/BotFather), disable Group Privacy, and create a supergroup with Topics enabled. Add the bot as administrator with Manage Topics permission.
+2. Deploy manually through the Cloudflare Worker editor using [worker.js](<worker.js>). Keep the dashboard KV binding named `TOPIC_MAP`. Git pushes run checks only; they do not publish this Worker.
+3. Create a Managed Turnstile widget in Cloudflare Dashboard. Allow the exact hostname used to access the Worker, without a scheme or path.
+4. Configure these variables and redeploy:
 
-Regardless of the deployment method, you must manually tell Telegram your Worker address. Visit the following URL in your browser **strictly in order**:
+| Setting | Required | Value |
+| --- | --- | --- |
+| `TOPIC_MAP` | Yes | KV binding |
+| `BOT_TOKEN` | Yes | Secret: Telegram bot token |
+| `SUPERGROUP_ID` | Yes | Group ID beginning with `-100` |
+| `WEBHOOK_SECRET` | Yes | Secret: random 1–256 characters from `A-Z`, `a-z`, `0-9`, `_`, `-` |
+| `PUBLIC_URL` | Yes | HTTPS root URL of this Worker, e.g. `https://bot.example.com`; no subpath, query, credentials or fragment |
+| `TURNSTILE_SITE_KEY` | Yes | Public widget Site Key |
+| `TURNSTILE_SECRET_KEY` | Yes | Secret: widget Secret Key |
+| `FILTER_KEYWORDS` | No | Default literal substrings, comma/newline-separated; used only before a list is saved through the Bot |
+| `ADMIN_IDS` | No | Comma/whitespace-separated extra authorized Telegram UIDs |
+| `API_BASE` | No | Trusted HTTPS Telegram API proxy; defaults to Telegram |
 
- **Set New Webhook**:
-    ```
-    [https://api.telegram.org/bot](https://api.telegram.org/bot)<YOUR_TOKEN>/setWebhook?url=<YOUR_WORKER_URL>
-    ```
-    *Replace `<YOUR_TOKEN>` with your bot token, and `<YOUR_WORKER_URL>` with your Worker's full domain or custom domain (e.g., `https://xxx.workers.dev`).*
+Never commit real credentials. Incomplete Turnstile settings fail closed; there is no local-quiz fallback. `/` receives Telegram updates and `/verify` serves verification.
 
-If it returns `{"ok":true, "result":true, "description":"Webhook was set"}`, the deployment is successful!
+Register the webhook from a trusted terminal, replacing placeholders:
 
----
+```bash
+curl -X POST "https://api.telegram.org/bot<BOT_TOKEN>/setWebhook" \
+  --data-urlencode "url=<PUBLIC_URL>/" \
+  --data-urlencode "secret_token=<WEBHOOK_SECRET>" \
+  --data-urlencode 'allowed_updates=["message","callback_query"]'
+```
 
-## ❓ FAQ
+Require `ok: true`. Do not share terminal history or screenshots containing credentials. Re-register after rotating the secret. Wrong/missing request headers return 401; an unconfigured webhook secret returns 503.
 
-**Q: Why does clicking the verification button do nothing?**
-A: Please check if the Webhook is set correctly. You must ensure Telegram is allowed to send `callback_query` events. Please perform the reset operation in the "Final Step" above.
+## Migration from v5.3
 
-**Q: Why can't the bot create topics in the group?**
-A: Please ensure: 1. Group ID is correct (starts with -100); 2. Topics are enabled in the group; 3. The bot is an administrator and has "Manage Topics" permission.
+Existing `banned:UID` entries, topic mappings and permanent `verified:UID = trusted` records remain compatible. Legacy quiz verification (`verified:UID = 1`) is not accepted: non-trusted users must verify on their next ordinary message. Old quiz buttons no longer work.
 
----
+First verify an isolated Worker/KV/test bot/group. Then add all new settings to production, and **register the new webhook secret while the old code is still running**: upstream ignores the additional header and continues working. Confirm delivery, then manually paste the verified code into the Cloudflare editor and deploy. Do not drop pending Telegram updates. Missing/unsigned webhooks will be rejected by the new version.
 
-## 🔒 Security Note
+The repository's [wrangler.toml](<wrangler.toml>) includes a placeholder KV example, not the real namespace ID. Editor-based deployment keeps the existing dashboard binding. If using Wrangler separately, supply the actual ID in a Git-ignored local config and use `keep_vars = true`; never run a real deployment from the placeholder config. Test deployments require separate KV/Bot/group resources. If deployment fails, roll back the code version without clearing KV or removing the webhook secret; upstream accepts the same signed requests.
 
-> [!IMPORTANT]
-> Please keep your Bot API Token and Secret Token safe, as this information is critical to the security of your service.
+## Tests and operational checks
 
-> [!WARNING]
-> Do not change the configured Secret Token arbitrarily! After changing it, all registered bots will fail to work because they cannot match the original token. If you need to change it, all bots must be re-registered.
+Node.js 22+, with pinned official development tools:
 
-- Choose a secure and memorable Secret Token during initial setup.
-- Avoid using simple or common prefixes.
-- Do not share sensitive information with others.
+```bash
+npm ci
+npm run check
+npm test
+npm run build
+```
 
----
+Tests include Node mocks and actual workerd/Miniflare execution with real local KV and the production compatibility date `2024-11-30`. Telegram/Siteverify traffic is intercepted; no real messages are sent. The build uses Wrangler dry-run, never uploading production code. [Worker checks](<.github/workflows/check.yml>) runs these checks on pushes and PRs without deployment credentials. After deployment, test the first-message gate, automatic webpage submission plus the newest signed Telegram confirmation, caption filtering, trust exemption, and `/block` → `/blocklist` → `/unblock`. Test `/menu` and `/info@your_bot`, keyword set/view/confirmed-clear, and command scopes: private chats and ordinary group members should see only `start`, while management-group administrators see the full list. Use `/reset UID` to exercise re-verification. If Telegram's embedded browser cannot solve the widget, use a system browser. Match `PUBLIC_URL` and the Turnstile hostname allowlist.
 
-## 📈 Star History
+Limits:
 
-[![Star History Chart](https://api.star-history.com/svg?repos=jikssha/telegram_private_chatbot&type=Date)](https://star-history.com/#jikssha/telegram_private_chatbot&Date)
+- KV is eventually consistent across locations. Same-instance verification operations are serialized, but rate limits, deduplication and block propagation are not globally atomic. Use Durable Objects if strict guarantees are needed.
+- Frequent writes to the KV pending queue may encounter platform limits. Resend on missing/failed delivery.
+- Verification links are short-lived sensitive bearer links. Do not share them. Telegram confirmation binds completion to the account, but does not prevent a person from outsourcing the CAPTCHA.
+- Delayed media groups recheck verification, blocks and keywords before sending. Filtering checks individual text/captions; it is not whole-album content moderation.
+- Real availability and cost depend on Telegram, Cloudflare, quotas and deployment settings. Mock tests do not replace a live smoke test.
 
----
-**If this project helps you, please give it a Star ⭐️!**
+References: [Telegram command scopes](https://core.telegram.org/api/bots/commands), [setMyCommands](https://core.telegram.org/bots/api#setmycommands), [Turnstile widget](https://developers.cloudflare.com/turnstile/get-started/client-side-rendering/), [server-side Siteverify](https://developers.cloudflare.com/turnstile/get-started/server-side-validation/), [Telegram setWebhook](https://core.telegram.org/bots/api#setwebhook).
+
+## License
+
+Upstream MIT License: [LICENSE](<LICENSE>).

@@ -1,10 +1,10 @@
-// Cloudflare Worker：Telegram 双向机器人 v5.3
+// Cloudflare Worker：Telegram 双向机器人（基于 v5.3，Turnstile 每日验证）
 
 // --- 配置常量 ---
 const CONFIG = {
-    VERIFY_ID_LENGTH: 12,
+    VERIFY_ID_LENGTH: 32,
     VERIFY_EXPIRE_SECONDS: 300,         // 5分钟
-    VERIFIED_EXPIRE_SECONDS: 2592000,   // 30天
+    VERIFIED_EXPIRE_SECONDS: 86400,     // 验证成功后 24 小时
     MEDIA_GROUP_EXPIRE_SECONDS: 60,
     MEDIA_GROUP_DELAY_MS: 3000,         // 3秒（从2秒增加）
     PENDING_MAX_MESSAGES: 10,           // 验证期间最多暂存的消息数
@@ -13,7 +13,6 @@ const CONFIG = {
     RATE_LIMIT_MESSAGE: 45,
     RATE_LIMIT_VERIFY: 3,
     RATE_LIMIT_WINDOW: 60,
-    BUTTON_COLUMNS: 2,
     MAX_TITLE_LENGTH: 128,
     MAX_NAME_LENGTH: 30,
     API_TIMEOUT_MS: 10000,
@@ -31,24 +30,8 @@ const topicCreateInFlight = new Map();
 // 管理员权限缓存（实例内）
 const adminStatusCache = new Map();
 
-// --- 本地题库 (15条) ---
-const LOCAL_QUESTIONS = [
-    {"question": "冰融化后会变成什么？", "correct_answer": "水", "incorrect_answers": ["石头", "木头", "火"]},
-    {"question": "正常人有几只眼睛？", "correct_answer": "2", "incorrect_answers": ["1", "3", "4"]},
-    {"question": "以下哪个属于水果？", "correct_answer": "香蕉", "incorrect_answers": ["白菜", "猪肉", "大米"]},
-    {"question": "1 加 2 等于几？", "correct_answer": "3", "incorrect_answers": ["2", "4", "5"]},
-    {"question": "5 减 2 等于几？", "correct_answer": "3", "incorrect_answers": ["1", "2", "4"]},
-    {"question": "2 乘以 3 等于几？", "correct_answer": "6", "incorrect_answers": ["4", "5", "7"]},
-    {"question": "10 加 5 等于几？", "correct_answer": "15", "incorrect_answers": ["10", "12", "20"]},
-    {"question": "8 减 4 等于几？", "correct_answer": "4", "incorrect_answers": ["2", "3", "5"]},
-    {"question": "在天上飞的交通工具是什么？", "correct_answer": "飞机", "incorrect_answers": ["汽车", "轮船", "自行车"]},
-    {"question": "星期一的后面是星期几？", "correct_answer": "星期二", "incorrect_answers": ["星期日", "星期五", "星期三"]},
-    {"question": "鱼通常生活在哪里？", "correct_answer": "水里", "incorrect_answers": ["树上", "土里", "火里"]},
-    {"question": "我们用什么器官来听声音？", "correct_answer": "耳朵", "incorrect_answers": ["眼睛", "鼻子", "嘴巴"]},
-    {"question": "晴朗的天空通常是什么颜色的？", "correct_answer": "蓝色", "incorrect_answers": ["绿色", "红色", "紫色"]},
-    {"question": "太阳从哪个方向升起？", "correct_answer": "东方", "incorrect_answers": ["西方", "南方", "北方"]},
-    {"question": "小狗发出的叫声通常是？", "correct_answer": "汪汪", "incorrect_answers": ["喵喵", "咩咩", "呱呱"]}
-];
+// shortcut: KV 跨节点最终一致，严格原子限流或去重需升级为 Durable Objects。
+const verificationInFlight = new Map();
 
 // --- 辅助工具函数 ---
 
@@ -117,14 +100,6 @@ const Logger = {
         console.log(JSON.stringify(log));
     }
 };
-
-// 加密安全的随机数生成
-function secureRandomInt(min, max) {
-    const range = max - min;
-    const bytes = new Uint32Array(1);
-    crypto.getRandomValues(bytes);
-    return min + (bytes[0] % range);
-}
 
 function secureRandomId(length = 12) {
     const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
@@ -257,10 +232,12 @@ async function probeForumThread(env, expectedThreadId, { userId, reason, doubleC
     return second;
 }
 
-async function resetUserVerificationAndRequireReverify(env, { userId, userKey, oldThreadId, pendingMsgId, reason }) {
-    // 清理旧映射与验证状态：用户需要重新做人机验证
-    await env.TOPIC_MAP.delete(`verified:${userId}`);
-    await env.TOPIC_MAP.put(`needs_verify:${userId}`, "1", { expirationTtl: CONFIG.NEEDS_REVERIFY_TTL_SECONDS });
+async function resetUserVerificationAndRequireReverify(env, { userId, userKey, oldThreadId, pendingMsg, reason }) {
+    const trusted = await env.TOPIC_MAP.get(`verified:${userId}`) === "trusted";
+    if (!trusted) {
+        await env.TOPIC_MAP.delete(`verified:${userId}`);
+        await env.TOPIC_MAP.put(`needs_verify:${userId}`, "1", { expirationTtl: CONFIG.NEEDS_REVERIFY_TTL_SECONDS });
+    }
     await env.TOPIC_MAP.delete(`retry:${userId}`);
 
     if (userKey) {
@@ -276,11 +253,16 @@ async function resetUserVerificationAndRequireReverify(env, { userId, userKey, o
     Logger.info('verification_reset_due_to_topic_loss', {
         userId,
         oldThreadId,
-        pendingMsgId,
+        pendingMsgId: pendingMsg?.message_id,
         reason
     });
 
-    await sendVerificationChallenge(userId, env, pendingMsgId || null);
+    if (trusted) {
+        await tgCall(env, "sendMessage", { chat_id: userId, text: "⚠️ 对话话题已失效，请重发刚才的消息以创建新话题。" });
+    } else {
+        await invalidateUserChallenge(env, userId);
+        await sendVerificationChallenge(userId, env, pendingMsg || null);
+    }
 }
 
 function parseAdminIdAllowlist(env) {
@@ -296,20 +278,20 @@ function parseAdminIdAllowlist(env) {
     return set.size > 0 ? set : null;
 }
 
-async function isAdminUser(env, userId) {
+async function isAdminUser(env, userId, refresh = false) {
     const allowlist = parseAdminIdAllowlist(env);
     if (allowlist && allowlist.has(String(userId))) return true;
 
     const cacheKey = String(userId);
     const now = Date.now();
     const cached = adminStatusCache.get(cacheKey);
-    if (cached && (now - cached.ts < CONFIG.ADMIN_CACHE_TTL_SECONDS * 1000)) {
+    if (!refresh && cached && (now - cached.ts < CONFIG.ADMIN_CACHE_TTL_SECONDS * 1000)) {
         return cached.isAdmin;
     }
 
     const kvKey = `admin:${userId}`;
     const kvVal = await env.TOPIC_MAP.get(kvKey);
-    if (kvVal === "1" || kvVal === "0") {
+    if (!refresh && (kvVal === "1" || kvVal === "0")) {
         const isAdmin = kvVal === "1";
         adminStatusCache.set(cacheKey, { ts: now, isAdmin });
         return isAdmin;
@@ -346,14 +328,37 @@ async function getAllKeys(env, prefix) {
     return allKeys;
 }
 
-// Fisher-Yates 洗牌算法
-function shuffleArray(arr) {
-    const array = [...arr];
-    for (let i = array.length - 1; i > 0; i--) {
-        const j = secureRandomInt(0, i + 1);
-        [array[i], array[j]] = [array[j], array[i]];
+function hasValidVerification(status) {
+    const expiresAt = Number(status);
+    return status === "trusted" || (Number.isSafeInteger(expiresAt) && expiresAt > Date.now());
+}
+
+function normalizeFilterText(text) {
+    return String(text || "").normalize("NFKC").toLowerCase().replace(/[\u200B-\u200D\uFEFF]/g, "");
+}
+
+async function getFilterKeywords(env) {
+    const stored = await env.TOPIC_MAP.get("settings:filter_keywords");
+    // 空字符串是明确关闭过滤；只有从未设置时才使用后台默认名单。
+    return stored === null ? String(env.FILTER_KEYWORDS || "") : stored;
+}
+
+async function matchesFilter(msg, env) {
+    const text = normalizeFilterText(`${msg.text || ""}\n${msg.caption || ""}`);
+    return (await getFilterKeywords(env)).split(/[,，\r\n]+/)
+        .map(word => normalizeFilterText(word.trim())).filter(Boolean)
+        .some(word => text.includes(word));
+}
+
+function turnstileOrigin(env) {
+    if (!env.TURNSTILE_SITE_KEY || !env.TURNSTILE_SECRET_KEY || !env.PUBLIC_URL) return null;
+    try {
+        const url = new URL(env.PUBLIC_URL);
+        if (url.protocol !== "https:" || url.username || url.password || url.pathname !== "/" || url.search || url.hash) return null;
+        return url.origin;
+    } catch {
+        return null;
     }
-    return array;
 }
 
 // 速率限制检查
@@ -389,7 +394,17 @@ export default {
         return new Response("Error: SUPERGROUP_ID must start with -100");
     }
 
-    if (request.method !== "POST") return new Response("OK");
+    const url = new URL(request.url);
+    if (url.pathname === "/verify") return handleTurnstileRequest(request, normalizedEnv);
+    if (url.pathname !== "/") return new Response("Not found", { status: 404 });
+    if (request.method === "GET") return new Response("OK");
+    if (request.method !== "POST") return new Response("Method not allowed", { status: 405 });
+
+    // Telegram 设置 secret_token 后会在每个更新中携带此请求头。
+    if (!env.WEBHOOK_SECRET) return new Response("Webhook secret not configured", { status: 503 });
+    if (request.headers.get("X-Telegram-Bot-Api-Secret-Token") !== env.WEBHOOK_SECRET) {
+        return new Response("Unauthorized", { status: 401 });
+    }
 
     // 验证 Content-Type
     const contentType = request.headers.get("content-type") || "";
@@ -464,6 +479,9 @@ async function handlePrivateMessage(msg, env, ctx) {
   const userId = msg.chat.id;
   const key = `user:${userId}`;
 
+  // 黑名单优先于 trust 和限流提示，封禁用户完全静默。
+  if (await env.TOPIC_MAP.get(`banned:${userId}`)) return;
+
   // 速率限制检查
   const rateLimit = await checkRateLimit(userId, env, 'message', CONFIG.RATE_LIMIT_MESSAGE, CONFIG.RATE_LIMIT_WINDOW);
   if (!rateLimit.allowed) {
@@ -479,15 +497,10 @@ async function handlePrivateMessage(msg, env, ctx) {
       return;
   }
 
-  const isBanned = await env.TOPIC_MAP.get(`banned:${userId}`);
-  if (isBanned) return;
-
-  const verified = await env.TOPIC_MAP.get(`verified:${userId}`);
-
-  if (!verified) {
-    const isStart = msg.text && msg.text.trim() === "/start";
-    const pendingMsgId = isStart ? null : msg.message_id;
-    await sendVerificationChallenge(userId, env, pendingMsgId);
+  if (msg.text?.trim() === "/start") {
+    const verified = await env.TOPIC_MAP.get(`verified:${userId}`);
+    if (!hasValidVerification(verified)) await sendVerificationChallenge(userId, env, null);
+    else await tgCall(env, "sendMessage", { chat_id: userId, text: "✅ 请直接发送您的消息。" });
     return;
   }
 
@@ -495,11 +508,19 @@ async function handlePrivateMessage(msg, env, ctx) {
 }
 
 async function forwardToTopic(msg, userId, key, env, ctx) {
-    // 并发兜底：如果已被标记为需要重新验证，直接发起验证并暂停转发/建话题
+    if (await env.TOPIC_MAP.get(`banned:${userId}`)) return false;
+    const verified = await env.TOPIC_MAP.get(`verified:${userId}`);
+    const trusted = verified === "trusted";
+    if (!trusted && await matchesFilter(msg, env)) {
+        Logger.info('message_keyword_filtered', { userId, messageId: msg.message_id });
+        return false;
+    }
     const needsVerify = await env.TOPIC_MAP.get(`needs_verify:${userId}`);
-    if (needsVerify) {
-        await sendVerificationChallenge(userId, env, msg.message_id || null);
-        return;
+    if (!trusted && (!hasValidVerification(verified) || needsVerify)) {
+        if (await sendVerificationChallenge(userId, env, msg) === "verified") {
+            return forwardToTopic(msg, userId, key, env, ctx);
+        }
+        return false;
     }
 
     // 【修复 #4】使用安全的 JSON 解析
@@ -560,7 +581,7 @@ async function forwardToTopic(msg, userId, key, env, ctx) {
                         userId,
                         userKey: key,
                         oldThreadId: rec.thread_id,
-                        pendingMsgId: msg.message_id,
+                        pendingMsg: msg,
                         reason: `health_check:${probe.status}`
                     });
                     return;
@@ -589,21 +610,42 @@ async function forwardToTopic(msg, userId, key, env, ctx) {
         }
     }
 
+    // 话题探测可能等待外部 API，实际发送前重新检查管理员变更。
+    if (await env.TOPIC_MAP.get(`banned:${userId}`)) return false;
+    const deliveryStatus = await env.TOPIC_MAP.get(`verified:${userId}`);
+    const deliveryTrusted = deliveryStatus === "trusted";
+    if (!deliveryTrusted && await matchesFilter(msg, env)) return false;
+    if (!deliveryTrusted && (!hasValidVerification(deliveryStatus) || await env.TOPIC_MAP.get(`needs_verify:${userId}`))) {
+        if (await sendVerificationChallenge(userId, env, msg) === "verified") {
+            return forwardToTopic(msg, userId, key, env, ctx);
+        }
+        return false;
+    }
+
     if (msg.media_group_id) {
         await handleMediaGroup(msg, env, ctx, {
             direction: "p2t",
             targetChat: env.SUPERGROUP_ID,
             threadId: rec.thread_id
         });
-        return;
+        return true;
     }
 
-    const res = await tgCall(env, "forwardMessage", {
-        chat_id: env.SUPERGROUP_ID,
-        from_chat_id: userId,
-        message_id: msg.message_id,
-        message_thread_id: rec.thread_id,
-    });
+    // 陌生人只能发送已检查的文本快照，避免验证期间编辑原消息绕过过滤。
+    const method = deliveryTrusted ? "forwardMessage" : (msg.text !== undefined ? "sendMessage" : "copyMessage");
+    const body = { chat_id: env.SUPERGROUP_ID, message_thread_id: rec.thread_id };
+    if (method === "sendMessage") {
+        body.text = msg.text;
+        if (msg.entities) body.entities = msg.entities;
+    } else {
+        body.from_chat_id = userId;
+        body.message_id = msg.message_id;
+        if (method === "copyMessage") {
+            body.caption = msg.caption || "";
+            if (msg.caption_entities) body.caption_entities = msg.caption_entities;
+        }
+    }
+    const res = await tgCall(env, method, body);
 
     // 检测 Telegram 静默重定向到 General 的情况
     const resThreadId = res.result?.message_thread_id;
@@ -629,14 +671,14 @@ async function forwardToTopic(msg, userId, key, env, ctx) {
             userId,
             userKey: key,
             oldThreadId: rec.thread_id,
-            pendingMsgId: msg.message_id,
+            pendingMsg: msg,
             reason: "forward_redirected_to_general"
         });
         return;
     }
 
     // 兜底：部分情况下 Telegram 返回 ok 但不带 message_thread_id（可能已落入 General）
-    if (res.ok && (resThreadId === undefined || resThreadId === null)) {
+    if (res.ok && method !== "copyMessage" && (resThreadId === undefined || resThreadId === null)) {
         const probe = await probeForumThread(env, rec.thread_id, { userId, reason: "forward_result_missing_thread_id" });
         if (probe.status !== "ok") {
             Logger.warn('forward_suspected_redirect_or_missing', {
@@ -661,7 +703,7 @@ async function forwardToTopic(msg, userId, key, env, ctx) {
                 userId,
                 userKey: key,
                 oldThreadId: rec.thread_id,
-                pendingMsgId: msg.message_id,
+                pendingMsg: msg,
                 reason: `forward_missing_thread_id:${probe.status}`
             });
             return;
@@ -682,7 +724,7 @@ async function forwardToTopic(msg, userId, key, env, ctx) {
                 userId,
                 userKey: key,
                 oldThreadId: rec.thread_id,
-                pendingMsgId: msg.message_id,
+                pendingMsg: msg,
                 reason: "forward_failed_topic_missing"
             });
             return;
@@ -691,55 +733,260 @@ async function forwardToTopic(msg, userId, key, env, ctx) {
         if (desc.includes("chat not found")) throw new Error(`群组ID错误: ${env.SUPERGROUP_ID}`);
         if (desc.includes("not enough rights")) throw new Error("机器人权限不足 (需 Manage Topics)");
 
-        // 如果forwardMessage失败，尝试使用copyMessage作为降级方案
-        await tgCall(env, "copyMessage", {
+        if (!deliveryTrusted) throw new Error("消息转发失败");
+        // 只有 trust 用户允许从原始消息降级复制。
+        const copied = await tgCall(env, "copyMessage", {
             chat_id: env.SUPERGROUP_ID,
             from_chat_id: userId,
             message_id: msg.message_id,
             message_thread_id: rec.thread_id
         });
+        if (!copied.ok) throw new Error("消息转发失败");
     }
+    return true;
+}
+
+function parsePositiveSafeUserId(value) {
+  const text = String(value || "");
+  if (!/^[1-9]\d*$/.test(text)) return null;
+  const userId = Number(text);
+  return Number.isSafeInteger(userId) && userId > 0 ? userId : null;
+}
+
+async function sendAdminReply(env, threadId, text, parseMode, replyMarkup) {
+  return await tgCall(env, "sendMessage", withMessageThreadId({
+      chat_id: env.SUPERGROUP_ID,
+      text,
+      ...(parseMode ? { parse_mode: parseMode } : {}),
+      ...(replyMarkup ? { reply_markup: replyMarkup } : {})
+  }, threadId));
+}
+
+async function showKeywordSettings(env, threadId) {
+  const keywords = await getFilterKeywords(env);
+  const enabled = keywords.split(/[,，\r\n]+/).some(word => normalizeFilterText(word.trim()));
+  const preview = keywords.length > 3000 ? `${keywords.slice(0, 3000)}\n（名单过长，显示已截断）` : keywords;
+  await sendAdminReply(env, threadId, `🔎 全局关键词过滤\n${enabled ? `当前名单:\n${preview}` : "未启用（名单为空）"}\n\n/setkeywords 词1,词2：替换名单\n/clearkeywords：确认后清空\n仅过滤未 trust 用户的文字和媒体说明。\nBot 设置优先于后台 FILTER_KEYWORDS，跨地区生效可能有约一分钟延迟。`, undefined, {
+      inline_keyboard: [[{ text: "🗑 清空关键词", callback_data: "admin:ask-clearkeywords:0" }]]
+  });
+}
+
+async function confirmClearKeywords(env, threadId) {
+  await sendAdminReply(env, threadId, "确认清空全局关键词名单并关闭过滤？不会改变任何用户的信任或封禁状态。", undefined, {
+      inline_keyboard: [[{ text: "确认清空", callback_data: "admin:clearkeywords:0" }, { text: "取消", callback_data: "admin:cancel:0" }]]
+  });
+}
+
+async function handleKeywordCommand(command, input, env, threadId) {
+  if (command === "/setkeywords") {
+      const words = [...new Set(input.split(/[,，\r\n]+/).map(word => normalizeFilterText(word.trim())).filter(Boolean))];
+      if (!words.length || input.length > 2048 || words.length > 100 || words.some(word => word.length > 128 || /[\u0000-\u001f\u007f]/.test(word)) || words.join(",").length > 2048) {
+          await sendAdminReply(env, threadId, "用法: /setkeywords 词1,词2\n最多100个词，每词不超过128字符，总计不超过2048字符。英文/中文逗号或换行分隔，空名单请用 /clearkeywords。");
+          return;
+      }
+      await env.TOPIC_MAP.put("settings:filter_keywords", words.join(","));
+      await sendAdminReply(env, threadId, `✅ 已保存 ${words.length} 个全局关键词（已规范化并去重）。\n${words.join(",")}\n跨地区生效可能有约一分钟延迟，无需重新部署。`);
+      return;
+  }
+  if (input) {
+      await sendAdminReply(env, threadId, `用法: ${command}（不带参数）`);
+      return;
+  }
+  if (command === "/keywords") await showKeywordSettings(env, threadId);
+  else await confirmClearKeywords(env, threadId);
+}
+
+async function getTopicUser(env, threadId) {
+  if (!Number.isSafeInteger(Number(threadId)) || Number(threadId) <= 1) return null;
+  const mapped = await env.TOPIC_MAP.get(`thread:${threadId}`);
+  if (mapped) return parsePositiveSafeUserId(mapped);
+  for (const { name } of await getAllKeys(env, "user:")) {
+      const record = await safeGetJSON(env, name, null);
+      if (record && Number(record.thread_id) === Number(threadId)) return parsePositiveSafeUserId(name.slice(5));
+  }
+  return null;
+}
+
+async function sendAdminMenu(env, threadId) {
+  const userId = await getTopicUser(env, threadId);
+  const button = (text, action) => ({ text, callback_data: `admin:${action}:${userId || 0}` });
+  const rows = [[button("🚫 黑名单", "blocklist"), button("📖 UID 指令", "help")],
+      [{ text: "🔎 全局关键词管理", callback_data: "admin:keywords:0" }]];
+  if (userId) rows.push(
+      [button("👤 用户信息", "info")],
+      [button("🚫 封禁", "ask-block"), button("✅ 解封", "ask-unblock")],
+      [button("🌟 永久信任", "ask-trust"), button("↩️ 取消信任", "ask-untrust")],
+      [button("🔄 重置验证", "ask-reset")],
+      [button("🔒 关闭会话", "ask-close"), button("🔓 打开会话", "ask-open")]
+  );
+  return sendAdminReply(env, threadId, userId
+      ? `🛠 管理菜单\n当前用户 UID: ${userId}\n用户操作仅针对本话题用户；关键词管理为全局设置。更改用户状态前会再次确认。`
+      : "🛠 管理菜单\n请进入用户话题发送 /menu 管理该用户，或查看 UID 指令。", undefined, { inline_keyboard: rows });
+}
+
+async function handleAdminMenuCallback(query, env, ctx) {
+  const match = /^admin:(ask-)?(blocklist|help|keywords|clearkeywords|info|block|unblock|trust|untrust|reset|close|open|cancel):(0|[1-9]\d*)$/.exec(query.data || "");
+  const answer = text => tgCall(env, "answerCallbackQuery", { callback_query_id: query.id, ...(text ? { text, show_alert: true } : {}) });
+  if (!match || !query.from?.id || String(query.message?.chat?.id) !== env.SUPERGROUP_ID || query.message.chat.type !== "supergroup") {
+      await answer("❌ 菜单无效，请在管理群重新发送 /menu。");
+      return;
+  }
+  if (!(await isAdminUser(env, query.from.id, true))) {
+      await answer("❌ 仅管理员可操作。");
+      return;
+  }
+  const [, confirm, action, target] = match;
+  const threadId = query.message.message_thread_id;
+  const currentUser = await getTopicUser(env, threadId);
+  if ((target !== "0" && String(currentUser) !== target) ||
+      (target === "0" && !["blocklist", "help", "keywords", "clearkeywords", "cancel"].includes(action)) ||
+      (["keywords", "clearkeywords"].includes(action) && target !== "0")) {
+      await answer("❌ 菜单目标已失效，请在用户话题重新发送 /menu。");
+      return;
+  }
+  await answer();
+  if (action === "cancel") return;
+  if (action === "keywords") {
+      await showKeywordSettings(env, threadId);
+      return;
+  }
+  if (action === "clearkeywords") {
+      if (confirm) await confirmClearKeywords(env, threadId);
+      else {
+          await env.TOPIC_MAP.put("settings:filter_keywords", "");
+          await sendAdminReply(env, threadId, "✅ 已清空全局关键词名单，过滤关闭。Bot 的空名单仍覆盖后台默认值，跨地区生效可能有约一分钟延迟。");
+      }
+      return;
+  }
+  if (action === "help") {
+      await sendAdminReply(env, threadId, "📖 按 UID 管理\n/block UID [原因]\n/unblock UID\n/trust UID（免验证码和关键词过滤）\n/untrust UID\n/reset UID（清除信任及验证）\n/blocklist [游标]\n进入用户话题发送 /menu，可直接管理该用户。");
+      return;
+  }
+  if (confirm) {
+      if (["blocklist", "info"].includes(action)) return;
+      const labels = { block: "封禁", unblock: "解封", trust: "永久信任（免验证码和关键词过滤）", untrust: "取消信任", reset: "重置验证（同时取消信任）", close: "关闭会话", open: "打开会话" };
+      await sendAdminReply(env, threadId, `确认对 UID ${target} 执行「${labels[action]}」？`, undefined, {
+          inline_keyboard: [[{ text: "确认操作", callback_data: `admin:${action}:${target}` }, { text: "取消", callback_data: `admin:cancel:${target}` }]]
+      });
+      return;
+  }
+  await handleAdminReply({ ...query.message, from: query.from, text: `/${action}` }, env, ctx);
+}
+
+async function handleBlockListCommand(env, threadId, cursor) {
+  if (cursor && cursor.length > 1024) return sendAdminReply(env, threadId, "❌ 分页游标无效，请使用 /blocklist 从第一页开始。");
+  let result;
+  try {
+      result = await env.TOPIC_MAP.list({ prefix: "banned:", limit: 50, ...(cursor ? { cursor } : {}) });
+  } catch {
+      return sendAdminReply(env, threadId, "⚠️ 无法读取黑名单，请检查分页游标或稍后重试。");
+  }
+  if (result.cursor && result.cursor.length > 1024) return sendAdminReply(env, threadId, "⚠️ 分页游标异常，请稍后重试。");
+  const lines = ["🚫 封禁用户列表"];
+
+  for (const key of result.keys || []) {
+      const userId = parsePositiveSafeUserId(key.name.slice("banned:".length));
+      if (!userId) continue;
+      const value = await env.TOPIC_MAP.get(key.name);
+      let suffix = "";
+      if (value && value !== "1") {
+          try {
+              const metadata = JSON.parse(value);
+              if (metadata.reason) {
+                  suffix = ` — ${String(metadata.reason).replace(/[\r\n]+/g, " ").slice(0, 32).replace(/\p{Surrogate}$/u, "")}`;
+              }
+          } catch {
+              // Legacy values are intentionally displayed without metadata.
+          }
+      }
+      lines.push(`${userId}${suffix}`);
+  }
+
+  if (lines.length === 1) lines.push("（空）");
+  if (!result.list_complete && result.cursor) lines.push(`下一页: /blocklist ${result.cursor}`);
+  return await sendAdminReply(env, threadId, lines.join("\n"));
+}
+
+async function normalizeAdminCommand(env, command) {
+  const match = /^\/[a-z0-9_]+(?:@([A-Za-z0-9_]+))?$/.exec(command);
+  if (!match) return null;
+  if (match[1]) {
+      const identity = await tgCall(env, "getMe", {});
+      if (!identity.ok || typeof identity.result?.username !== "string" ||
+          identity.result.username.toLowerCase() !== match[1].toLowerCase()) return null;
+  }
+  return command.split("@")[0];
 }
 
 async function handleAdminReply(msg, env, ctx) {
   const threadId = msg.message_thread_id;
   const text = (msg.text || "").trim();
   const senderId = msg.from?.id;
+  const parts = text.split(/\s+/);
+  let command = parts[0] || "";
+  const args = parts.slice(1);
+  const targetCommands = new Set(["/block", "/unblock", "/ban", "/unban", "/trust", "/untrust", "/reset"]);
 
   // 仅允许管理员在群内操作与回信，防止任意群成员向用户私聊注入消息
-  if (!senderId || !(await isAdminUser(env, senderId))) {
+  const keywordCommands = ["/keywords", "/setkeywords", "/clearkeywords"];
+  if (!senderId || !(await isAdminUser(env, senderId, keywordCommands.includes(command.split("@")[0])))) return;
+  if (text.startsWith("/")) {
+      command = await normalizeAdminCommand(env, command);
+      if (!command) return;
+  }
+
+  if (keywordCommands.includes(command)) {
+      try {
+          await handleKeywordCommand(command, text.slice(parts[0].length).trim(), env, threadId);
+      } catch (error) {
+          Logger.error('keyword_settings_failed', error);
+          await sendAdminReply(env, threadId, "⚠️ 关键词配置读写失败，请稍后重试；未确认保存成功的设置不要视为已生效。");
+      }
+      return;
+  }
+
+  if (command === "/menu") {
+      if (args.length === 0) await sendAdminMenu(env, threadId);
       return;
   }
 
   // 【修复】允许在任何话题执行 /cleanup 命令
-  if (text === "/cleanup") {
+  if (command === "/cleanup" && args.length === 0) {
       // /cleanup 可能处理较久，使用 waitUntil 防止 webhook 请求超时导致“卡住”
       ctx.waitUntil(handleCleanupCommand(threadId, env));
       return;
   }
 
-  // 优先通过 thread 映射快速反查用户，缺失时再降级全量扫描
-  let userId = null;
-  const mappedUser = await env.TOPIC_MAP.get(`thread:${threadId}`);
-  if (mappedUser) {
-      userId = Number(mappedUser);
-  } else {
-      const allKeys = await getAllKeys(env, "user:");
-      for (const { name } of allKeys) {
-          const rec = await safeGetJSON(env, name, null);
-          if (rec && Number(rec.thread_id) === Number(threadId)) {
-              userId = Number(name.slice(5));
-              break;
-          }
+  if (command === "/blocklist") {
+      if (args.length > 1) return;
+      await handleBlockListCommand(env, threadId, args[0]);
+      return;
+  }
+
+  let explicitUserId = null;
+  if (targetCommands.has(command) && args.length > 0) {
+      explicitUserId = parsePositiveSafeUserId(args[0]);
+      if (!explicitUserId) {
+          await sendAdminReply(env, threadId, `用法: ${command} [正整数UID]`);
+          return;
       }
   }
 
+  const moderationCommand = targetCommands.has(command);
+  let userId = explicitUserId;
+
+  // Unknown slash commands must never be copied to a private user.
+  if (text.startsWith("/") && !moderationCommand && !["/close", "/open", "/info"].includes(command)) return;
+
+  // 菜单和文本命令使用相同的话题映射，避免 General 被误识别为用户会话。
+  if (!userId) userId = await getTopicUser(env, threadId);
+
   // 如果找不到用户，说明可能是在普通话题，或者数据丢失，直接返回
-  if (!userId) return; 
+  if (!userId) return;
 
   // --- 指令区域 ---
 
-  if (text === "/close") {
+  if (command === "/close" && args.length === 0) {
       const key = `user:${userId}`;
       let rec = await safeGetJSON(env, key, null);
       if (rec) {
@@ -751,7 +998,7 @@ async function handleAdminReply(msg, env, ctx) {
       return;
   }
 
-  if (text === "/open") {
+  if (command === "/open" && args.length === 0) {
       const key = `user:${userId}`;
       let rec = await safeGetJSON(env, key, null);
       if (rec) {
@@ -763,39 +1010,55 @@ async function handleAdminReply(msg, env, ctx) {
       return;
   }
 
-  if (text === "/reset") {
-      await env.TOPIC_MAP.delete(`verified:${userId}`);
-      await tgCall(env, "sendMessage", { chat_id: env.SUPERGROUP_ID, message_thread_id: threadId, text: "🔄 **验证重置**", parse_mode: "Markdown" });
+  if (targetCommands.has(command)) {
+      const targetId = userId;
+      await serializeVerification(targetId, async () => {
+          if (command === "/block" || command === "/ban") {
+              const reason = explicitUserId && args.length > 1
+                  ? args.slice(1).join(" ").trim().slice(0, 200)
+                  : "";
+              const value = reason
+                  ? JSON.stringify({ actor: senderId, timestamp: Date.now(), reason })
+                  : "1";
+              await env.TOPIC_MAP.put(`banned:${targetId}`, value);
+              await env.TOPIC_MAP.delete(`verified:${targetId}`);
+              await env.TOPIC_MAP.delete(`needs_verify:${targetId}`);
+              await invalidateUserChallenge(env, targetId);
+              await sendAdminReply(env, threadId, "🚫 **用户已封禁**", "Markdown");
+          } else if (command === "/unblock" || command === "/unban") {
+              await env.TOPIC_MAP.delete(`banned:${targetId}`);
+              await sendAdminReply(env, threadId, "✅ **用户已解封**", "Markdown");
+          } else if (command === "/trust") {
+              await env.TOPIC_MAP.put(`verified:${targetId}`, "trusted");
+              await env.TOPIC_MAP.delete(`needs_verify:${targetId}`);
+              await invalidateUserChallenge(env, targetId);
+              await sendAdminReply(env, threadId, "🌟 **已设置永久信任**", "Markdown");
+          } else if (command === "/untrust") {
+              await env.TOPIC_MAP.delete(`verified:${targetId}`);
+              await env.TOPIC_MAP.delete(`needs_verify:${targetId}`);
+              await invalidateUserChallenge(env, targetId);
+              await sendAdminReply(env, threadId, "↩️ **已取消信任**", "Markdown");
+          } else if (command === "/reset") {
+              await env.TOPIC_MAP.delete(`verified:${targetId}`);
+              await env.TOPIC_MAP.delete(`needs_verify:${targetId}`);
+              await invalidateUserChallenge(env, targetId);
+              await sendAdminReply(env, threadId, "🔄 **验证重置**", "Markdown");
+          }
+      });
       return;
   }
 
-  if (text === "/trust") {
-      await env.TOPIC_MAP.put(`verified:${userId}`, "trusted");
-      await env.TOPIC_MAP.delete(`needs_verify:${userId}`);
-      await tgCall(env, "sendMessage", { chat_id: env.SUPERGROUP_ID, message_thread_id: threadId, text: "🌟 **已设置永久信任**", parse_mode: "Markdown" });
-      return;
-  }
-
-  if (text === "/ban") {
-      await env.TOPIC_MAP.put(`banned:${userId}`, "1");
-      await tgCall(env, "sendMessage", { chat_id: env.SUPERGROUP_ID, message_thread_id: threadId, text: "🚫 **用户已封禁**", parse_mode: "Markdown" });
-      return;
-  }
-
-  if (text === "/unban") {
-      await env.TOPIC_MAP.delete(`banned:${userId}`);
-      await tgCall(env, "sendMessage", { chat_id: env.SUPERGROUP_ID, message_thread_id: threadId, text: "✅ **用户已解封**", parse_mode: "Markdown" });
-      return;
-  }
-
-  if (text === "/info") {
+  if (command === "/info" && args.length === 0) {
       const userKey = `user:${userId}`;
       const userRec = await safeGetJSON(env, userKey, null);
       const verifyStatus = await env.TOPIC_MAP.get(`verified:${userId}`);
       const banStatus = await env.TOPIC_MAP.get(`banned:${userId}`);
+      const verificationText = hasValidVerification(verifyStatus)
+          ? (verifyStatus === "trusted" ? "🌟 永久信任" : "✅ 已验证")
+          : "❌ 未验证";
 
-      const info = `👤 **用户信息**\nUID: \`${userId}\`\nTopic ID: \`${threadId}\`\n话题标题: ${userRec?.title || "未知"}\n验证状态: ${verifyStatus ? (verifyStatus === 'trusted' ? '🌟 永久信任' : '✅ 已验证') : '❌ 未验证'}\n封禁状态: ${banStatus ? '🚫 已封禁' : '✅ 正常'}\nLink: [点击私聊](tg://user?id=${userId})`;
-      await tgCall(env, "sendMessage", { chat_id: env.SUPERGROUP_ID, message_thread_id: threadId, text: info, parse_mode: "Markdown" });
+      const info = `👤 <b>用户信息</b>\nUID: <code>${userId}</code>\nTopic ID: <code>${threadId}</code>\n话题标题: ${escapeHtml(userRec?.title || "未知")}\n验证状态: ${verificationText}\n封禁状态: ${banStatus ? '🚫 已封禁' : '✅ 正常'}\nLink: <a href="tg://user?id=${userId}">点击私聊</a>`;
+      await tgCall(env, "sendMessage", { chat_id: env.SUPERGROUP_ID, message_thread_id: threadId, text: info, parse_mode: "HTML" });
       return;
   }
 
@@ -804,263 +1067,283 @@ async function handleAdminReply(msg, env, ctx) {
     await handleMediaGroup(msg, env, ctx, { direction: "t2p", targetChat: userId, threadId: undefined });
     return;
   }
+  if (text.startsWith("/")) return;
   await tgCall(env, "copyMessage", { chat_id: userId, from_chat_id: env.SUPERGROUP_ID, message_id: msg.message_id });
 }
 
-// ---------------- 验证模块 (纯本地) ----------------
+// ---------------- Turnstile 验证 ----------------
 
-async function sendVerificationChallenge(userId, env, pendingMsgId) {
-    // 【修复 #1】检查是否已有进行中的验证
-    const existingChallenge = await env.TOPIC_MAP.get(`user_challenge:${userId}`);
-    if (existingChallenge) {
-        // 有正在进行的验证：仅将新消息加入待发送队列，避免重复下发题目/触发验证限速
-        const chalKey = `chal:${existingChallenge}`;
-        const state = await safeGetJSON(env, chalKey, null);
+async function serializeVerification(userId, operation) {
+    const key = String(userId);
+    const previous = verificationInFlight.get(key);
+    const current = (previous ? previous.catch(() => {}) : Promise.resolve()).then(operation);
+    verificationInFlight.set(key, current);
+    try {
+        return await current;
+    } finally {
+        if (verificationInFlight.get(key) === current) verificationInFlight.delete(key);
+    }
+}
 
-        // KV 可能存在不一致/过期：自愈清理后重新下发
-        if (!state || state.userId !== userId) {
-            await env.TOPIC_MAP.delete(`user_challenge:${userId}`);
-        } else {
-            if (pendingMsgId) {
-                let pendingIds = [];
-                if (Array.isArray(state.pending_ids)) {
-                    pendingIds = state.pending_ids.slice();
-                } else if (state.pending) {
-                    pendingIds = [state.pending];
-                }
+async function invalidateUserChallenge(env, userId) {
+    const id = await env.TOPIC_MAP.get(`user_challenge:${userId}`);
+    if (id) await env.TOPIC_MAP.delete(`chal:${id}`);
+    await env.TOPIC_MAP.delete(`user_challenge:${userId}`);
+}
 
-                if (!pendingIds.includes(pendingMsgId)) {
-                    pendingIds.push(pendingMsgId);
-                    if (pendingIds.length > CONFIG.PENDING_MAX_MESSAGES) {
-                        pendingIds = pendingIds.slice(pendingIds.length - CONFIG.PENDING_MAX_MESSAGES);
-                    }
-                    state.pending_ids = pendingIds;
-                    delete state.pending;
-                    await env.TOPIC_MAP.put(chalKey, JSON.stringify(state), { expirationTtl: CONFIG.VERIFY_EXPIRE_SECONDS });
-                }
-            }
-            Logger.debug('verification_duplicate_skipped', { userId, verifyId: existingChallenge, hasPending: !!pendingMsgId });
+async function getActiveChallenge(env, id) {
+    if (!/^[a-z0-9]{32}$/.test(id || "")) return null;
+    const state = await safeGetJSON(env, `chal:${id}`);
+    if (!state || state.kind !== "turnstile" || !(state.expiresAt > Date.now())) return null;
+    if (await env.TOPIC_MAP.get(`user_challenge:${state.userId}`) !== id) return null;
+    if (await env.TOPIC_MAP.get(`banned:${state.userId}`)) return null;
+    return state;
+}
+
+async function saveChallenge(env, id, state) {
+    await env.TOPIC_MAP.put(`chal:${id}`, JSON.stringify(state), {
+        expirationTtl: Math.max(60, Math.ceil((state.expiresAt - Date.now()) / 1000))
+    });
+}
+
+function pendingMessage(msg) {
+    if (!msg) return null;
+    // 保留过滤和媒体组所需字段，不存无关的用户资料或消息实体。
+    const result = {};
+    for (const key of ["message_id", "chat", "from", "text", "entities", "caption", "caption_entities", "media_group_id", "photo", "video", "document", "audio", "animation"]) {
+        if (msg[key] !== undefined) result[key] = msg[key];
+    }
+    return result;
+}
+
+async function sendVerificationChallenge(userId, env, msg) {
+    return serializeVerification(userId, async () => {
+        if (await env.TOPIC_MAP.get(`banned:${userId}`)) return;
+        const status = await env.TOPIC_MAP.get(`verified:${userId}`);
+        if (hasValidVerification(status) && (status === "trusted" || !(await env.TOPIC_MAP.get(`needs_verify:${userId}`)))) return "verified";
+        const origin = turnstileOrigin(env);
+        if (!origin) {
+            await tgCall(env, "sendMessage", { chat_id: userId, text: "⚠️ 验证服务尚未配置，请稍后再试。" });
             return;
         }
-    }
-
-    // 验证请求速率限制：仅在需要创建新挑战时检查
-    const verifyLimit = await checkRateLimit(userId, env, 'verify', CONFIG.RATE_LIMIT_VERIFY, 300);
-    if (!verifyLimit.allowed) {
-        await tgCall(env, "sendMessage", {
+        const existingId = await env.TOPIC_MAP.get(`user_challenge:${userId}`);
+        const existing = await getActiveChallenge(env, existingId);
+        if (existing && String(existing.userId) === String(userId)) {
+            if (msg && !existing.pending_messages.some(item => item.message_id === msg.message_id) && existing.pending_messages.length < CONFIG.PENDING_MAX_MESSAGES) {
+                existing.pending_messages.push(pendingMessage(msg));
+                await saveChallenge(env, existingId, existing);
+            }
+            return;
+        }
+        await invalidateUserChallenge(env, userId);
+        const limit = await checkRateLimit(userId, env, 'verify', CONFIG.RATE_LIMIT_VERIFY, 300);
+        if (!limit.allowed) {
+            await tgCall(env, "sendMessage", { chat_id: userId, text: "⚠️ 验证请求过于频繁，请5分钟后再试。" });
+            return;
+        }
+        const id = secureRandomId(CONFIG.VERIFY_ID_LENGTH);
+        const state = {
+            kind: "turnstile", userId, expiresAt: Date.now() + CONFIG.VERIFY_EXPIRE_SECONDS * 1000,
+            pending_messages: msg ? [pendingMessage(msg)] : [], turnstilePassed: false
+        };
+        await saveChallenge(env, id, state);
+        await env.TOPIC_MAP.put(`user_challenge:${userId}`, id, { expirationTtl: CONFIG.VERIFY_EXPIRE_SECONDS });
+        const result = await tgCall(env, "sendMessage", {
             chat_id: userId,
-            text: "⚠️ 验证请求过于频繁，请5分钟后再试。"
+            text: "🛡️ 请打开网页完成人机验证并提交，然后点击机器人发来的最新「确认验证」按钮。验证成功后24小时内免重复验证。链接5分钟有效，最多暂存前10条消息，超出或过期后请重发。请勿转发验证链接。",
+            reply_markup: { inline_keyboard: [
+                [{ text: "打开 Turnstile 验证", url: `${origin}/verify?id=${id}` }]
+            ] }
         });
-        return;
-    }
-
-    // 【修复 #9】使用加密安全的随机数
-    const q = LOCAL_QUESTIONS[secureRandomInt(0, LOCAL_QUESTIONS.length)];
-    const challenge = {
-        question: q.question,
-        correct: q.correct_answer,
-        options: shuffleArray([...q.incorrect_answers, q.correct_answer])
-    };
-
-    // 【修复 #9】使用加密安全的ID生成
-    const verifyId = secureRandomId(CONFIG.VERIFY_ID_LENGTH);
-
-    // 【修复 #6】使用答案索引而非文本，避免截断问题
-    const answerIndex = challenge.options.indexOf(challenge.correct);
-
-    const state = {
-        answerIndex: answerIndex,      // 存储索引
-        options: challenge.options,     // 存储完整选项列表
-        pending_ids: pendingMsgId ? [pendingMsgId] : [],
-        userId: userId                  // 添加用户ID验证
-    };
-
-    await env.TOPIC_MAP.put(`chal:${verifyId}`, JSON.stringify(state), { expirationTtl: CONFIG.VERIFY_EXPIRE_SECONDS });
-
-    // 【修复 #1】标记用户正在验证中
-    await env.TOPIC_MAP.put(`user_challenge:${userId}`, verifyId, { expirationTtl: CONFIG.VERIFY_EXPIRE_SECONDS });
-
-    Logger.info('verification_sent', {
-        userId,
-        verifyId,
-        question: q.question,
-        pendingCount: state.pending_ids.length
+        if (!result.ok) {
+            await invalidateUserChallenge(env, userId);
+            throw new Error("无法发送验证码链接");
+        }
+        Logger.info('verification_sent', { userId });
     });
+}
 
-    // 【修复 #6】按钮使用索引而非文本
-    const buttons = challenge.options.map((opt, idx) => ({
-        text: opt,
-        callback_data: `verify:${verifyId}:${idx}`  // 使用索引
-    }));
+function escapeHtml(value) {
+    return String(value).replace(/[&<>"']/g, char => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[char]));
+}
 
-    const keyboard = [];
-    for (let i = 0; i < buttons.length; i += CONFIG.BUTTON_COLUMNS) {
-        keyboard.push(buttons.slice(i, i + CONFIG.BUTTON_COLUMNS));
+async function createConfirmationProof(env, id, state) {
+    const encoder = new TextEncoder();
+    const key = await crypto.subtle.importKey("raw", encoder.encode(env.WEBHOOK_SECRET), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+    const payload = `turnstile-confirm:${id}:${state.userId}:${state.expiresAt}`;
+    const signature = new Uint8Array(await crypto.subtle.sign("HMAC", key, encoder.encode(payload)));
+    // 96-bit HMAC 加上挑战 ID 恰好占用 Telegram callback_data 的 64 字节上限。
+    return btoa(String.fromCharCode(...signature.slice(0, 12))).replace(/\+/g, "-").replace(/\//g, "_");
+}
+
+async function sendPassedChallengeConfirmation(env, id, state) {
+    if (!env.WEBHOOK_SECRET) return verificationPage("确认服务尚未配置，请联系管理员。", 503);
+    const proof = await createConfirmationProof(env, id, state);
+    const result = await tgCall(env, "sendMessage", {
+        chat_id: state.userId, text: "✅ 网页验证已通过，请点击这条消息的「确认验证」。",
+        reply_markup: { inline_keyboard: [[{ text: "确认验证", callback_data: `verify:${id}:confirm:${proof}` }]] }
+    });
+    if (!result.ok) return verificationPage("网页验证已通过，但发送确认按钮失败，请再次提交。", 503);
+    return verificationPage("网页验证已通过，Telegram 已发送新的确认消息。请点击最新消息的「确认验证」。");
+}
+
+function verificationPage(message, status = 200, form = "") {
+    const nonce = secureRandomId(32);
+    const autoSubmit = form ? `<script nonce="${nonce}">
+function onTurnstileSolved(token) {
+    const form = document.getElementById('verify-form');
+    if (!token || form.dataset.submitting) return;
+    form.dataset.submitting = '1';
+    document.getElementById('turnstile-token').value = token;
+    document.getElementById('verify-status').textContent = '正在提交验证，请稍候…';
+    form.requestSubmit();
+}
+function onTurnstileError() {
+    document.getElementById('verify-status').textContent = '验证码加载失败，请检查网络或刷新网页重试。';
+}
+function onTurnstileExpired() {
+    document.getElementById('verify-status').textContent = '验证码已过期，请重新完成验证。';
+}
+</script>` : "";
+    return new Response(`<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Telegram 人机验证</title>
+${autoSubmit}<script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
+<style>body{font-family:system-ui,sans-serif;max-width:440px;margin:48px auto;padding:20px;line-height:1.7}button{padding:12px 24px;margin-top:16px;cursor:pointer}h1{font-size:24px}</style></head>
+<body><h1>Telegram 人机验证</h1><p id="verify-status" role="status" aria-live="polite">${escapeHtml(message)}</p>${form}</body></html>`, {
+        status, headers: {
+            "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store",
+            // no-referrer 会使原生表单 POST 发送 Origin:null，误拒绝同源提交。
+            "Referrer-Policy": "same-origin", "X-Content-Type-Options": "nosniff",
+            "X-Frame-Options": "DENY",
+            "Content-Security-Policy": `default-src 'none'; script-src 'nonce-${nonce}' https://challenges.cloudflare.com; frame-src https://challenges.cloudflare.com; connect-src https://challenges.cloudflare.com; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'`
+        }
+    });
+}
+
+async function handleTurnstileRequest(request, env) {
+    const origin = turnstileOrigin(env);
+    if (!origin) return verificationPage("验证服务尚未配置，请联系管理员。", 503);
+    const url = new URL(request.url);
+    if (url.origin !== origin) return verificationPage("请使用机器人提供的验证域名。", 400);
+    const id = url.searchParams.get("id");
+    const state = await getActiveChallenge(env, id);
+    if (!state) return verificationPage("验证链接已失效，请回到 Telegram 重新发送消息。", 410);
+    if (request.method === "GET") {
+        if (state.turnstilePassed) return verificationPage("网页验证已通过，请回到 Telegram 点击「确认验证」。");
+        const form = `<form id="verify-form" method="post" action="/verify?id=${escapeHtml(id)}"><input id="turnstile-token" type="hidden" name="cf-turnstile-response"><div class="cf-turnstile" data-sitekey="${escapeHtml(env.TURNSTILE_SITE_KEY)}" data-action="telegram_private_chat" data-cdata="${escapeHtml(id)}" data-response-field="false" data-callback="onTurnstileSolved" data-error-callback="onTurnstileError" data-expired-callback="onTurnstileExpired"></div></form><noscript>请启用 JavaScript 后刷新网页，验证码通过后会自动提交。</noscript>`;
+        return verificationPage("请完成人机验证，通过后自动提交。随后回到 Telegram 点击最新消息中的「确认验证」。", 200, form);
     }
-
-    await tgCall(env, "sendMessage", {
-        chat_id: userId,
-        text: `🛡️ **人机验证**\n\n${challenge.question}\n\n请点击下方按钮回答 (回答正确后将自动发送您刚才的消息)。`,
-        parse_mode: "Markdown",
-        reply_markup: { inline_keyboard: keyboard }
+    if (request.method !== "POST") return verificationPage("不支持此请求方式。", 405);
+    if (request.headers.get("Origin") !== origin) return verificationPage("无效的请求来源。", 403);
+    if (!(request.headers.get("Content-Type") || "").startsWith("application/x-www-form-urlencoded")) return verificationPage("无效的表单。", 415);
+    // 按流限制请求体，避免未携带 Content-Length 的请求耗尽内存。
+    const reader = request.body?.getReader();
+    if (!reader) return verificationPage("请先完成验证码。", 400);
+    const decoder = new TextDecoder();
+    let body = "", size = 0;
+    while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        size += value.byteLength;
+        if (size > 8192) {
+            await reader.cancel();
+            return verificationPage("表单过大。", 413);
+        }
+        body += decoder.decode(value, { stream: true });
+    }
+    body += decoder.decode();
+    const token = new URLSearchParams(body).get("cf-turnstile-response");
+    if (!token || token.length > 2048) return verificationPage("请先完成验证码，再提交。", 400);
+    return serializeVerification(state.userId, async () => {
+        const current = await getActiveChallenge(env, id);
+        if (!current) return verificationPage("验证链接已失效，请重新发送消息。", 410);
+        if (current.turnstilePassed) return sendPassedChallengeConfirmation(env, id, current);
+        let result;
+        try {
+            const response = await fetch("https://challenges.cloudflare.com/turnstile/v0/siteverify", {
+                method: "POST", headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ secret: env.TURNSTILE_SECRET_KEY, response: token, remoteip: request.headers.get("CF-Connecting-IP") || undefined }),
+                signal: AbortSignal.timeout(CONFIG.API_TIMEOUT_MS)
+            });
+            if (!response.ok) return verificationPage("验证服务暂时不可用，请刷新后重试。", 503);
+            result = await response.json();
+        } catch (error) {
+            Logger.error('turnstile_siteverify_failed', error);
+            return verificationPage("验证服务暂时不可用，请刷新后重试。", 503);
+        }
+        if (!result || result.success !== true || result.hostname !== new URL(origin).hostname || result.action !== "telegram_private_chat" || result.cdata !== id) {
+            return verificationPage("验证码无效或已过期，请刷新网页后重新验证。", 400);
+        }
+        // Siteverify 请求期间管理员可能封禁或重置了用户，不能用旧状态恢复验证。
+        const latest = await getActiveChallenge(env, id);
+        if (!latest) return verificationPage("验证链接已失效，请重新发送消息。", 410);
+        latest.turnstilePassed = true;
+        await saveChallenge(env, id, latest);
+        return sendPassedChallengeConfirmation(env, id, latest);
     });
 }
 
 async function handleCallbackQuery(query, env, ctx) {
-    try {
-        const data = query.data;
-        if (!data.startsWith("verify:")) return;
-
-        const parts = data.split(":");
-        if (parts.length !== 3) return;
-
-        const verifyId = parts[1];
-        const selectedIndex = parseInt(parts[2]);  // 【修复 #6】用户选择的索引
-        const userId = query.from.id;
-
-        const stateStr = await env.TOPIC_MAP.get(`chal:${verifyId}`);
-        if (!stateStr) {
-            await tgCall(env, "answerCallbackQuery", {
-                callback_query_id: query.id,
-                text: "❌ 验证已过期，请重发消息",
-                show_alert: true
-            });
-            return;
-        }
-
-        let state;
+    if ((query.data || "").startsWith("admin:")) {
         try {
-            state = JSON.parse(stateStr);
-        } catch(e) {
-             await tgCall(env, "answerCallbackQuery", {
-                 callback_query_id: query.id,
-                 text: "❌ 数据错误",
-                 show_alert: true
-             });
-             return;
+            await handleAdminMenuCallback(query, env, ctx);
+        } catch (error) {
+            Logger.error('admin_menu_callback_failed', error);
+            await tgCall(env, "answerCallbackQuery", { callback_query_id: query.id, text: "⚠️ 操作失败，请重新打开菜单或稍后重试。", show_alert: true });
         }
-
-        // 【修复 #1】验证用户ID匹配
-        if (state.userId && state.userId !== userId) {
-            await tgCall(env, "answerCallbackQuery", {
-                callback_query_id: query.id,
-                text: "❌ 无效的验证",
-                show_alert: true
-            });
-            return;
-        }
-
-        // 【修复 #6】验证索引有效性
-        if (isNaN(selectedIndex) || selectedIndex < 0 || selectedIndex >= state.options.length) {
-            await tgCall(env, "answerCallbackQuery", {
-                callback_query_id: query.id,
-                text: "❌ 无效选项",
-                show_alert: true
-            });
-            return;
-        }
-
-        if (selectedIndex === state.answerIndex) {
-            await tgCall(env, "answerCallbackQuery", {
-                callback_query_id: query.id,
-                text: "✅ 验证通过"
-            });
-
-            Logger.info('verification_passed', {
-                userId,
-                verifyId,
-                selectedOption: state.options[selectedIndex]
-            });
-
-            // 30天有效期 - 使用配置常量
-            await env.TOPIC_MAP.put(`verified:${userId}`, "1", { expirationTtl: CONFIG.VERIFIED_EXPIRE_SECONDS });
-            await env.TOPIC_MAP.delete(`needs_verify:${userId}`);
-
-            // 【修复 #1】清理所有相关挑战
-            await env.TOPIC_MAP.delete(`chal:${verifyId}`);
-            await env.TOPIC_MAP.delete(`user_challenge:${userId}`);
-
-            await tgCall(env, "editMessageText", {
-                chat_id: userId,
-                message_id: query.message.message_id,
-                text: "✅ **验证成功**\n\n您现在可以自由对话了。",
-                parse_mode: "Markdown"
-            });
-
-            const hasPending = (Array.isArray(state.pending_ids) && state.pending_ids.length > 0) || !!state.pending;
-            if (hasPending) {
-                try {
-                    let pendingIds = [];
-                    if (Array.isArray(state.pending_ids)) {
-                        pendingIds = state.pending_ids.slice();
-                    } else if (state.pending) {
-                        pendingIds = [state.pending];
-                    }
-
-                    // 限制一次性转发量，避免用户恶意堆积导致执行超时
-                    if (pendingIds.length > CONFIG.PENDING_MAX_MESSAGES) {
-                        pendingIds = pendingIds.slice(pendingIds.length - CONFIG.PENDING_MAX_MESSAGES);
-                    }
-
-                    let forwardedCount = 0;
-                    for (const pendingId of pendingIds) {
-                        if (!pendingId) continue;
-                        const forwardedKey = `forwarded:${userId}:${pendingId}`;
-                        const alreadyForwarded = await env.TOPIC_MAP.get(forwardedKey);
-                        if (alreadyForwarded) {
-                            Logger.info('message_forward_duplicate_skipped', { userId, messageId: pendingId });
-                            continue;
-                        }
-
-                        const fakeMsg = {
-                            message_id: pendingId,
-                            chat: { id: userId, type: "private" },
-                            from: query.from,
-                        };
-
-                        await forwardToTopic(fakeMsg, userId, `user:${userId}`, env, ctx);
-                        await env.TOPIC_MAP.put(forwardedKey, "1", { expirationTtl: 3600 });
-                        forwardedCount++;
-                    }
-
-                    if (forwardedCount > 0) {
-                        await tgCall(env, "sendMessage", {
-                            chat_id: userId,
-                            text: `📩 刚才的 ${forwardedCount} 条消息已帮您送达。`
-                        });
-                    }
-                } catch (e) {
-                    Logger.error('pending_message_forward_failed', e, { userId });
-                    await tgCall(env, "sendMessage", {
-                        chat_id: userId,
-                        text: "⚠️ 自动发送失败，请重新发送您的消息。"
-                    });
-                }
+        return;
+    }
+    const match = /^verify:([a-z0-9]{32}):confirm(?::([A-Za-z0-9_-]{16}))?$/.exec(query.data || "");
+    if (!match || !query.from?.id) return;
+    const userId = query.from.id;
+    try {
+        await serializeVerification(userId, async () => {
+            const state = await getActiveChallenge(env, match[1]);
+            if (!state || String(state.userId) !== String(userId) || query.message?.chat?.type !== "private" || String(query.message.chat.id) !== String(userId)) {
+                await tgCall(env, "answerCallbackQuery", { callback_query_id: query.id, text: "❌ 验证已失效或不属于您，请重发消息", show_alert: true });
+                return;
             }
-        } else {
-            Logger.info('verification_failed', {
-                userId,
-                verifyId,
-                selectedIndex,
-                correctIndex: state.answerIndex
-            });
+            let passed = state.turnstilePassed;
+            if (match[2]) {
+                const expected = await createConfirmationProof(env, match[1], state);
+                let difference = 0;
+                for (let i = 0; i < expected.length; i++) difference |= expected.charCodeAt(i) ^ match[2].charCodeAt(i);
+                passed = difference === 0;
+            }
+            if (!passed) {
+                await tgCall(env, "answerCallbackQuery", { callback_query_id: query.id, text: "请先打开网页并提交验证码，再点击最新的确认按钮。", show_alert: true });
+                return;
+            }
+            const existing = await env.TOPIC_MAP.get(`verified:${userId}`);
+            if (existing !== "trusted") {
+                await env.TOPIC_MAP.put(`verified:${userId}`, String(Date.now() + CONFIG.VERIFIED_EXPIRE_SECONDS * 1000), { expirationTtl: CONFIG.VERIFIED_EXPIRE_SECONDS });
+            }
+            await env.TOPIC_MAP.delete(`needs_verify:${userId}`);
+            await invalidateUserChallenge(env, userId);
+            await tgCall(env, "answerCallbackQuery", { callback_query_id: query.id, text: "✅ 验证通过" });
+            await tgCall(env, "editMessageText", { chat_id: userId, message_id: query.message.message_id, text: "✅ 验证成功，24小时内无需重复验证。" });
+            // 释放实例内验证锁后回放，避免话题失效重新发起验证时自锁。
+            ctx.waitUntil(forwardPendingMessages(state, userId, env, ctx));
+        });
+    } catch (error) {
+        Logger.error('callback_query_error', error, { userId });
+        await tgCall(env, "answerCallbackQuery", { callback_query_id: query.id, text: "⚠️ 验证失败，请重试", show_alert: true });
+    }
+}
 
-            await tgCall(env, "answerCallbackQuery", {
-                callback_query_id: query.id,
-                text: "❌ 答案错误",
-                show_alert: true
-            });
+async function forwardPendingMessages(state, userId, env, ctx) {
+    try {
+        for (const msg of (state.pending_messages || []).slice(0, CONFIG.PENDING_MAX_MESSAGES)) {
+            const key = `forwarded:${userId}:${msg.message_id}`;
+            if (await env.TOPIC_MAP.get(key)) continue;
+            if (await forwardToTopic(msg, userId, `user:${userId}`, env, ctx)) {
+                await env.TOPIC_MAP.put(key, "1", { expirationTtl: 3600 });
+            }
         }
-    } catch (e) {
-        Logger.error('callback_query_error', e, {
-            userId: query.from?.id,
-            callbackData: query.data
-        });
-        await tgCall(env, "answerCallbackQuery", {
-            callback_query_id: query.id,
-            text: `⚠️ 系统错误，请重试`,
-            show_alert: true
-        });
+    } catch (error) {
+        Logger.error('pending_message_forward_failed', error, { userId });
+        if (!(await env.TOPIC_MAP.get(`banned:${userId}`))) {
+            await tgCall(env, "sendMessage", { chat_id: userId, text: "⚠️ 自动发送失败，请重新发送您的消息。" });
+        }
     }
 }
 
@@ -1138,7 +1421,10 @@ async function handleCleanupCommand(threadId, env) {
                     // cleanup 要求更保守：仅在明确缺失/重定向时清理，避免误删有效记录
                     if (probe.status === "redirected" || probe.status === "missing") {
                             await env.TOPIC_MAP.delete(name);
-                            await env.TOPIC_MAP.delete(`verified:${userId}`);
+                            if (await env.TOPIC_MAP.get(`verified:${userId}`) !== "trusted") {
+                                await env.TOPIC_MAP.delete(`verified:${userId}`);
+                                await invalidateUserChallenge(env, userId);
+                            }
                             await env.TOPIC_MAP.delete(`thread:${topicThreadId}`);
 
                             return {
@@ -1397,11 +1683,12 @@ async function handleMediaGroup(msg, env, ctx, { direction, targetChat, threadId
         return;
     }
     let rec = await safeGetJSON(env, key, null);
-    if (!rec) rec = { direction, targetChat, threadId: (threadId === null ? undefined : threadId), items: [], last_ts: Date.now() };
+    if (!rec) rec = { direction, targetChat, sourceUserId: msg.chat.id, threadId: (threadId === null ? undefined : threadId), items: [], last_ts: Date.now() };
     rec.items.push({ ...item, msg_id: msg.message_id });
     rec.last_ts = Date.now();
+    rec.send_id = secureRandomId();
     await env.TOPIC_MAP.put(key, JSON.stringify(rec), { expirationTtl: CONFIG.MEDIA_GROUP_EXPIRE_SECONDS });
-    ctx.waitUntil(delaySend(env, key, rec.last_ts));
+    ctx.waitUntil(delaySend(env, key, rec.send_id));
 }
 
 // 【修复 #15, #19】改进的媒体提取（支持更多类型，不修改原数组）
@@ -1480,12 +1767,25 @@ async function flushExpiredMediaGroups(env, now) {
 }
 
 // 【修复 #12, #28】改进媒体组延迟发送
-async function delaySend(env, key, ts) {
+async function delaySend(env, key, sendId) {
     await new Promise(r => setTimeout(r, CONFIG.MEDIA_GROUP_DELAY_MS));
 
     const rec = await safeGetJSON(env, key, null);
 
-    if (rec && rec.last_ts === ts) {
+    if (rec && rec.send_id === sendId) {
+        if (!Array.isArray(rec.items) || rec.items.length === 0) {
+            await env.TOPIC_MAP.delete(key);
+            return;
+        }
+        if (rec.direction === "p2t") {
+            const userId = rec.sourceUserId;
+            const status = userId ? await env.TOPIC_MAP.get(`verified:${userId}`) : null;
+            if (!userId || await env.TOPIC_MAP.get(`banned:${userId}`) || !hasValidVerification(status) ||
+                (status !== "trusted" && (await env.TOPIC_MAP.get(`needs_verify:${userId}`) || await matchesFilter({ caption: rec.items.map(item => item.cap || "").join("\n") }, env)))) {
+                await env.TOPIC_MAP.delete(key);
+                return;
+            }
+        }
         // 验证媒体数组
         if (!rec.items || rec.items.length === 0) {
             Logger.warn('media_group_empty', { key });
@@ -1509,10 +1809,12 @@ async function delaySend(env, key, ts) {
 
         if (media.length > 0) {
             try {
-                const result = await tgCall(env, "sendMediaGroup", withMessageThreadId({
-                    chat_id: rec.targetChat,
-                    media
-                }, rec.threadId));
+                const single = media.length === 1 ? media[0] : null;
+                const method = single ? `send${single.type[0].toUpperCase()}${single.type.slice(1)}` : "sendMediaGroup";
+                const body = single
+                    ? { chat_id: rec.targetChat, [single.type]: single.media, caption: single.caption }
+                    : { chat_id: rec.targetChat, media };
+                const result = await tgCall(env, method, withMessageThreadId(body, rec.threadId));
 
                 if (!result.ok) {
                     Logger.error('media_group_send_failed', result.description, {
